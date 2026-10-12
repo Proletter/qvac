@@ -29,6 +29,7 @@
 #include <js.h>
 #include <parakeet/fit.h>
 #include <parakeet/log.h>
+#include <parakeet/moss_transcribe_fit.h>
 #include <whisper.h>
 
 #include "addon/AsrErrors.hpp"
@@ -39,6 +40,7 @@
 #include "model-interface/ParakeetTypes.hpp"
 #include "model-interface/StreamingProcessor.hpp"
 #include "model-interface/WhisperTypes.hpp"
+#include "model-interface/moss/MossTranscribeModel.hpp"
 #include "model-interface/parakeet/ParakeetModel.hpp"
 #include "model-interface/whisper/WhisperModel.hpp"
 
@@ -198,9 +200,13 @@ transcriptToJsObject(js_env_t* env, const parakeet::Transcript& t) {
       env, "id", js::Number::create(env, static_cast<uint64_t>(t.id)));
   obj.setProperty(env, "isEndOfTurn", js::Boolean::create(env, t.isEndOfTurn));
   obj.setProperty(env, "startsWord", js::Boolean::create(env, t.startsWord));
-  // Sortformer only; ASR segments keep their existing shape.
+  // Sortformer and MOSS-Transcribe-Diarize only; ASR segments keep their
+  // existing shape.
   if (t.speakerId >= 0) {
     obj.setProperty(env, "speakerId", js::Number::create(env, t.speakerId));
+  }
+  if (!t.speaker.empty()) {
+    obj.setProperty(env, "speaker", js::String::create(env, t.speaker));
   }
   if (!t.speakerSegments.empty()) {
     auto segments = js::Array::create(env);
@@ -307,6 +313,10 @@ inline js_value_t* createInstance(js_env_t* env, js_callback_info_t* info) try {
     model = std::move(ownedModel);
     outputHandlers.add(make_shared<JsParakeetTranscriptArrayHandler>());
     outputHandlers.add(make_shared<JsParakeetVadEventHandler>());
+  } else if (engineType == EngineType::MossTranscribe) {
+    model = make_unique<moss::MossTranscribeModel>(
+        adapter.buildMossTranscribeConfig(configurationParams, env));
+    outputHandlers.add(make_shared<JsParakeetTranscriptArrayHandler>());
   } else {
     model = make_unique<whisper::WhisperModel>(
         adapter.buildWhisperConfig(configurationParams, env));
@@ -363,6 +373,17 @@ inline js_value_t* runJob(js_env_t* env, js_callback_info_t* info) try {
     return instance.runJob(any(std::move(inputSamples)));
   }
 
+  if (dynamic_cast<moss::MossTranscribeModel*>(
+          &instance.addonCpp->model.get()) != nullptr) {
+    moss::MossTranscribeModel::AnyInput mossInput;
+    mossInput.samples =
+        js::TypedArray<float>(env, jsInput).as<vector<float>>(env);
+    JSAdapter adapter;
+    mossInput.request =
+        adapter.readMossTranscribeRequest(args.getJsObject(1, "inputObj"), env);
+    return instance.runJob(any(std::move(mossInput)));
+  }
+
   auto inputObj = args.getJsObject(1, "inputObj");
   string audioFormat = "s16le";
   auto maybeAudioFormat =
@@ -402,6 +423,13 @@ inline js_value_t* reload(js_env_t* env, js_callback_info_t* info) try {
         "reload is not supported for the parakeet engine; destroy and "
         "recreate the instance");
   }
+  if (dynamic_cast<moss::MossTranscribeModel*>(
+          &instance.addonCpp->model.get()) != nullptr) {
+    throw errors::parakeet::makeStatus(
+        errors::parakeet::Code::ReloadNotSupported,
+        "reload is not supported for the moss-transcribe engine; destroy and "
+        "recreate the instance");
+  }
 
   auto configurationParams = args.getJsObject(1, "configurationParams");
   JSAdapter adapter;
@@ -433,6 +461,101 @@ JSCATCH
 inline js_value_t*
 whisperFit(js_env_t* env, js::Object request, const std::string& modelPath);
 
+inline js_value_t*
+asrFitResultToJs(js_env_t* env, const ::parakeet::FitResult& fit) {
+  const char* status = "error";
+  if (fit.status == ::parakeet::FitStatus::Success) {
+    status = "fits";
+  } else if (fit.status == ::parakeet::FitStatus::Failure) {
+    status = "does-not-fit";
+  }
+
+  auto result = js::Object::create(env);
+  auto text = [&](const char* name, const std::string& value) {
+    result.setProperty(env, name, js::String::create(env, value));
+  };
+  auto bytes = [&](const char* name, uint64_t value) {
+    result.setProperty(
+        env, name, js::Number::create(env, static_cast<double>(value)));
+  };
+
+  text("status", status);
+  text("reason", fit.reason);
+  text("modelType", fit.model_type);
+  text("modelVariant", fit.model_variant);
+  text("deviceName", fit.device_name);
+  text("report", fit.report);
+  result.setProperty(
+      env, "deviceIsCpu", js::Boolean::create(env, fit.device_is_cpu));
+  result.setProperty(
+      env,
+      "deviceSharesHostMemory",
+      js::Boolean::create(env, fit.device_shares_host_memory));
+  bytes("deviceFreeBytes", fit.device_free_bytes);
+  bytes("deviceTotalBytes", fit.device_total_bytes);
+  bytes("deviceBytes", fit.device.total_bytes);
+  bytes("weightsBytes", fit.device.weights_bytes);
+  bytes("encoderComputeBytes", fit.device.encoder_compute_bytes);
+  bytes("decoderStateBytes", fit.device.decoder_state_bytes);
+  bytes("decoderComputeBytes", fit.device.decoder_compute_bytes);
+  bytes("hostBytes", fit.host_bytes);
+
+  return result;
+}
+
+inline double readMossFitNumber(
+    js_env_t* env, js::Object request, const char* name, double fallback,
+    bool integer) {
+  auto value = request.getOptionalProperty<js::Number>(env, name);
+  if (!value.has_value())
+    return fallback;
+  const double raw = value->as<double>(env);
+  if (!std::isfinite(raw) || raw < 0 ||
+      (integer &&
+       (std::floor(raw) != raw || raw > std::numeric_limits<int>::max()))) {
+    throw qvac_errors::StatusError(
+        qvac_errors::general_error::InvalidArgument,
+        std::string("assessFit: invalid ") + name);
+  }
+  return raw;
+}
+
+inline js_value_t* mossTranscribeFit(
+    js_env_t* env, js::Object request, const std::string& modelPath) {
+  constexpr uint64_t DEFAULT_FIT_MARGIN_BYTES = 256ull * 1024 * 1024;
+  const double seconds =
+      readMossFitNumber(env, request, "audioSeconds", 0, false);
+  if (modelPath.empty() || seconds <= 0) {
+    throw qvac_errors::StatusError(
+        qvac_errors::general_error::InvalidArgument,
+        "assessFit: modelPath and positive audioSeconds are required for "
+        "moss-transcribe");
+  }
+  moss::MossTranscribeConfig config;
+  config.modelPath = modelPath;
+  config.maxThreads =
+      static_cast<int>(readMossFitNumber(env, request, "threads", 0, true));
+  config.useGPU = readMossFitNumber(env, request, "gpuLayers", 0, true) > 0;
+  if (auto dir = request.getOptionalProperty<js::String>(env, "backendsDir")) {
+    config.backendsDir = dir->as<std::string>(env);
+  }
+  readMossFitNumber(env, request, "maxNewTokens", 0, true);
+  JSAdapter adapter;
+  const auto call = adapter.readMossTranscribeRequest(request, env);
+  const double rawMargin = readMossFitNumber(
+      env, request, "marginBytes", DEFAULT_FIT_MARGIN_BYTES, false);
+  const uint64_t margin =
+      rawMargin >= static_cast<double>(std::numeric_limits<uint64_t>::max())
+          ? std::numeric_limits<uint64_t>::max()
+          : static_cast<uint64_t>(rawMargin);
+  const auto fit = ::parakeet::moss::fit_params(
+      moss::MossTranscribeModel::toEngineOptions(config),
+      moss::MossTranscribeModel::toEngineRequest(call),
+      seconds,
+      margin);
+  return asrFitResultToJs(env, fit);
+}
+
 inline js_value_t* assessFit(js_env_t* env, js_callback_info_t* info) try {
   using namespace qvac_lib_inference_addon_cpp;
 
@@ -446,6 +569,9 @@ inline js_value_t* assessFit(js_env_t* env, js_callback_info_t* info) try {
     const std::string name = engine->as<std::string>(env);
     if (name == "whisper") {
       return whisperFit(env, request, modelPath);
+    }
+    if (name == "moss-transcribe") {
+      return mossTranscribeFit(env, request, modelPath);
     }
     // An unrecognised name reaches the parakeet fitter with a model it cannot
     // read, and the caller sees a broken model for what is a broken request.
@@ -508,44 +634,7 @@ inline js_value_t* assessFit(js_env_t* env, js_callback_info_t* info) try {
 
   const ::parakeet::FitResult fit = ::parakeet::fit_params(options);
 
-  const char* status = "error";
-  if (fit.status == ::parakeet::FitStatus::Success) {
-    status = "fits";
-  } else if (fit.status == ::parakeet::FitStatus::Failure) {
-    status = "does-not-fit";
-  }
-
-  auto result = js::Object::create(env);
-  auto text = [&](const char* name, const std::string& value) {
-    result.setProperty(env, name, js::String::create(env, value));
-  };
-  auto bytes = [&](const char* name, uint64_t value) {
-    result.setProperty(
-        env, name, js::Number::create(env, static_cast<double>(value)));
-  };
-
-  text("status", status);
-  text("reason", fit.reason);
-  text("modelType", fit.model_type);
-  text("modelVariant", fit.model_variant);
-  text("deviceName", fit.device_name);
-  text("report", fit.report);
-  result.setProperty(
-      env, "deviceIsCpu", js::Boolean::create(env, fit.device_is_cpu));
-  result.setProperty(
-      env,
-      "deviceSharesHostMemory",
-      js::Boolean::create(env, fit.device_shares_host_memory));
-  bytes("deviceFreeBytes", fit.device_free_bytes);
-  bytes("deviceTotalBytes", fit.device_total_bytes);
-  bytes("deviceBytes", fit.device.total_bytes);
-  bytes("weightsBytes", fit.device.weights_bytes);
-  bytes("encoderComputeBytes", fit.device.encoder_compute_bytes);
-  bytes("decoderStateBytes", fit.device.decoder_state_bytes);
-  bytes("decoderComputeBytes", fit.device.decoder_compute_bytes);
-  bytes("hostBytes", fit.host_bytes);
-
-  return result;
+  return asrFitResultToJs(env, fit);
 }
 JSCATCH
 
@@ -712,6 +801,26 @@ inline js_value_t* getBackendInfo(js_env_t* env, js_callback_info_t* info) try {
         env,
         "modelType",
         js::String::create(env, parakeetModel->getModelTypeName()));
+    return result;
+  }
+
+  if (auto* mossModel = dynamic_cast<moss::MossTranscribeModel*>(
+          &instance.addonCpp->model.get())) {
+    result.setProperty(
+        env,
+        "backendDevice",
+        js::String::create(
+            env,
+            std::string(
+                mossModel->getBackendDeviceClass() == 1 ? "GPU" : "CPU")));
+    result.setProperty(
+        env, "backendId", js::Number::create(env, mossModel->getBackendId()));
+    result.setProperty(
+        env,
+        "backendName",
+        js::String::create(env, mossModel->getBackendName()));
+    result.setProperty(
+        env, "modelType", js::String::create(env, "moss-transcribe"));
     return result;
   }
 
@@ -981,6 +1090,13 @@ inline js_value_t* startStreaming(js_env_t* env, js_callback_info_t* info) try {
   JsArgsParser args(env, info);
   AddonJs& instance = JsInterface::getInstance(env, args.get(0, "instance"));
   auto configObj = args.getJsObject(1, "config");
+  if (dynamic_cast<moss::MossTranscribeModel*>(
+          &instance.addonCpp->model.get()) != nullptr) {
+    throw qvac_errors::StatusError(
+        qvac_errors::general_error::InvalidArgument,
+        "the moss-transcribe engine transcribes whole recordings and does not "
+        "stream; use run()");
+  }
 
   // Order matters, and it is the pre-merge order: parse/validate the config,
   // then let the registry run the double-start check and the construction as
