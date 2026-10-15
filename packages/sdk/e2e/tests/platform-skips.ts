@@ -13,6 +13,14 @@ type Rule = {
 }
 
 const RULES: Rule[] = [
+  {
+    match: /^tts-moss-/,
+    skip: {
+      reason:
+        'MOSS-SoundEffect and MOSS-Speech require desktop GPU memory; Python MOSS step bindings are not yet exposed.',
+      platforms: ['mobile', 'desktop-python']
+    }
+  },
   // ── every leg but Snap ───────────────────────────────────────────────────
   {
     match: /^snap-storage-/,
@@ -98,17 +106,17 @@ const RULES: Rule[] = [
     }
   },
   {
-    match: /^multi-gpu-/,
-    skip: {
-      reason: 'Multi-GPU tests disabled on mobile (not supported on single-GPU devices)',
-      platforms: ['mobile']
-    }
-  },
-  {
     match: /^deferred-tools-(?!prompt-cost$|load-then-call$)/,
     skip: {
       reason:
         'Deferred tools: only the smoke cases run on mobile (no tools-qwen35 resource, model reloads too slow)',
+      platforms: ['mobile']
+    }
+  },
+  {
+    match: ['kv-cache-warm-tool-choice-required'],
+    skip: {
+      reason: 'The forced tool call reasons past the Device Farm test timeout',
       platforms: ['mobile']
     }
   },
